@@ -1,0 +1,7 @@
+langchain
+langchain-core
+langchain-community
+langchain-ollama
+faiss-cpu
+gradio
+pypdf
