@@ -1,290 +1,424 @@
 """
 generate_dataset.py
 
-Generates a large synthetic dataset of UK university courses, in the same
-shape as the sample data provided:
+Builds a synthetic-but-structured dataset of UK universities and the
+courses they offer, starting from a CSV of real UK universities
+(name, region, founded year, motto, UK rank).
 
-    {"university": "...", "course": "...", "focus": ["...", "...", "..."]}
+For every university in the CSV, this script:
+  - keeps the real-world fields (Region, Founded year, Motto, UK Rank)
+  - adds synthetic-but-plausible admissions statistics:
+        acceptance_rate_pct                (overall acceptance rate)
+        international_acceptance_rate_pct  (acceptance rate for
+                                             international applicants)
+        india_friendly_score (1-10)        (how accessible / welcoming
+                                             the university is reported
+                                             to be for Indian applicants,
+                                             considering things like
+                                             scholarships, dedicated
+                                             recruitment, visa & post
+                                             study work support, and the
+                                             size of the existing Indian
+                                             student community)
+        competitiveness                    (Very High / High / Medium /
+                                             Low to Medium - derived from
+                                             UK rank)
+  - generates a wide spread of courses across many departments
+    (Science, Technology & Engineering, Commerce & Business,
+    Arts & Humanities, Geography & Environment, Sports, Literature,
+    Languages & Linguistics, Medicine & Health Sciences, Law,
+    Social Sciences). Every university gets AT LEAST 10 courses from
+    EACH department.
 
-By default it generates 100,000 records and writes them to
-`courses_dataset.json` (a single JSON array) and also to
-`courses_dataset.jsonl` (one JSON object per line, easier to stream for
-large files / RAG ingestion).
+Two output files are written:
+
+  universities_dataset.json
+      One JSON object per university:
+        {
+          "university": "...",
+          "region": "...",
+          "founded_year": 1096,
+          "motto": "...",
+          "uk_rank": 1,
+          "acceptance_rate_pct": 7.2,
+          "international_acceptance_rate_pct": 9.8,
+          "india_friendly_score": 6,
+          "competitiveness": "Very High",
+          "courses": [
+              {"course": "BSc Physics", "department": "Science",
+               "focus": ["Physics", "Research"]},
+              ...
+          ]
+        }
+
+  courses_dataset.jsonl
+      A flattened, one-line-per-course view of the same data (one
+      record per (university, course) pair, with the university-level
+      fields repeated on every line). This is the file consumed by
+      build_vectorstore.py / app.py for retrieval, since RAG retrieval
+      operates at the course level.
 
 Usage:
     python generate_dataset.py
-    python generate_dataset.py --count 100000 --seed 42 --out courses_dataset
+    python generate_dataset.py --csv uk_universities.csv --seed 42 \
+        --out courses_dataset --uni-out universities_dataset.json
 """
 
 import argparse
+import csv
 import json
 import random
 
 # ---------------------------------------------------------------------------
-# Reference data
+# Departments: each maps to a pool of course titles (>= 10) and a pool of
+# "focus" tags relevant to that department.
 # ---------------------------------------------------------------------------
 
-UNIVERSITIES = [
-    "University of Cambridge", "University of Oxford", "Imperial College London",
-    "University College London", "University of Edinburgh", "King's College London",
-    "London School of Economics", "University of Manchester", "University of Bristol",
-    "University of Warwick", "University of Glasgow", "University of Birmingham",
-    "University of Leeds", "University of Sheffield", "University of Southampton",
-    "University of Nottingham", "Durham University", "University of York",
-    "Queen Mary University of London", "University of St Andrews", "Lancaster University",
-    "University of Exeter", "Cardiff University", "Newcastle University",
-    "Queen's University Belfast", "University of Bath", "University of Liverpool",
-    "Loughborough University", "University of Surrey", "University of Sussex",
-    "University of Leicester", "University of Reading", "Royal Holloway, University of London",
-    "Aston University", "University of East Anglia", "Heriot-Watt University",
-    "University of Aberdeen", "University of Dundee", "Brunel University London",
-    "City, University of London", "University of Strathclyde", "Swansea University",
-    "University of Stirling", "University of Essex", "University of Kent",
-    "Birkbeck, University of London", "Coventry University", "University of Portsmouth",
-    "University of the West of England", "Northumbria University",
-]
-
-# Degree prefixes, weighted towards taught masters which dominate UK postgrad listings
-DEGREE_TYPES = [
-    "MSc", "MSc", "MSc", "MA", "MRes", "MPhil", "MEng", "PGDip", "PGCert", "MBA",
-]
-
-# Each subject maps to: a list of natural-sounding course-title variants
-# and a pool of "focus" tags relevant to that subject.
-SUBJECTS = {
-    "Artificial Intelligence": {
-        "variants": [
-            "Artificial Intelligence",
-            "Advanced Computer Science (Artificial Intelligence)",
-            "Artificial Intelligence and Machine Learning",
-            "Applied Artificial Intelligence",
+DEPARTMENTS = {
+    "Science": {
+        "courses": [
+            "BSc Physics", "BSc Chemistry", "BSc Biology", "BSc Mathematics",
+            "MSc Astrophysics", "BSc Biochemistry", "MSc Neuroscience",
+            "BSc Materials Science", "MSc Applied Mathematics", "BSc Genetics",
+            "MSc Theoretical Physics", "BSc Forensic Science",
+            "BSc Molecular Biology", "MSc Computational Science",
         ],
-        "focus_pool": ["AI", "ML", "Research", "Robotics", "Applied ML", "Computer Vision", "NLP"],
+        "focus_pool": [
+            "Physics", "Chemistry", "Biology", "Mathematics", "Research",
+            "Laboratory Work", "Data Analysis", "Genetics",
+        ],
     },
-    "Machine Learning": {
-        "variants": [
-            "Machine Learning",
-            "Machine Learning and Machine Intelligence",
-            "Statistical Machine Learning",
-            "Machine Learning Systems",
+    "Technology & Engineering": {
+        "courses": [
+            "BEng Computer Science", "MSc Artificial Intelligence",
+            "BEng Electrical Engineering", "MSc Robotics",
+            "BEng Mechanical Engineering", "MSc Cybersecurity",
+            "BEng Civil Engineering", "MSc Data Science",
+            "BEng Aerospace Engineering", "MSc Software Engineering",
+            "BEng Chemical Engineering", "MSc Cloud Computing",
+            "BEng Electronic Engineering", "MSc Machine Learning",
         ],
-        "focus_pool": ["ML", "AI", "Data Science", "NLP", "Deep Learning", "Statistics", "Research"],
+        "focus_pool": [
+            "AI", "Machine Learning", "Software Engineering", "Cybersecurity",
+            "Robotics", "Cloud Computing", "Data Science", "Engineering",
+        ],
     },
-    "Data Science": {
-        "variants": [
-            "Data Science",
-            "Data Science and Analytics",
-            "Data Science and Artificial Intelligence",
-            "Big Data Science",
+    "Commerce & Business": {
+        "courses": [
+            "BSc Business Administration", "MSc Finance",
+            "BSc Accounting and Finance", "MSc Marketing",
+            "BSc Economics", "MBA Business Management",
+            "BSc International Business", "MSc Human Resource Management",
+            "BSc Entrepreneurship", "MSc Supply Chain Management",
+            "BSc Banking and Finance", "MSc Business Analytics",
+            "BSc Management with Marketing", "MSc International Management",
         ],
-        "focus_pool": ["Data Science", "ML", "Big Data", "Analytics", "Statistics", "AI", "Cloud Computing"],
+        "focus_pool": [
+            "Finance", "Business", "Economics", "Marketing", "Management",
+            "Analytics", "Strategy", "Entrepreneurship",
+        ],
     },
-    "Cybersecurity": {
-        "variants": [
-            "Cyber Security",
-            "Information Security",
-            "Cyber Security and Networks",
-            "Cyber Security Management",
+    "Arts & Humanities": {
+        "courses": [
+            "BA Philosophy", "BA History", "BA Fine Art",
+            "BA Theology and Religious Studies", "BA Classics",
+            "BA Archaeology", "MA Art History", "BA Cultural Studies",
+            "BA Anthropology", "MA Philosophy and Ethics",
+            "BA Museum Studies", "BA Ancient History",
+            "BA Religious Studies", "MA History of Art",
         ],
-        "focus_pool": ["Cybersecurity", "Networks", "Cryptography", "Cloud Computing", "Risk Management", "Ethical Hacking"],
+        "focus_pool": [
+            "History", "Philosophy", "Art", "Theology", "Culture",
+            "Anthropology", "Research", "Critical Thinking",
+        ],
     },
-    "Robotics": {
-        "variants": [
-            "Robotics",
-            "Robotics and Autonomous Systems",
-            "Advanced Robotics",
-            "Robotics and Artificial Intelligence",
+    "Geography & Environment": {
+        "courses": [
+            "BSc Geography", "BSc Environmental Science",
+            "MSc Urban Planning", "BSc Geology", "MSc Climate Change",
+            "BSc Earth Sciences", "MSc Environmental Management",
+            "BSc Oceanography", "MSc Sustainable Development",
+            "BSc Human Geography", "MSc Geographic Information Systems",
+            "BSc Physical Geography", "BSc Environmental Geoscience",
+            "MSc Geospatial Science",
         ],
-        "focus_pool": ["Robotics", "AI", "Control Systems", "Mechatronics", "Applied ML", "Computer Vision"],
+        "focus_pool": [
+            "Geography", "Environmental Science", "Sustainability",
+            "Climate", "GIS", "Urban Planning", "Earth Sciences", "Research",
+        ],
     },
-    "Software Engineering": {
-        "variants": [
-            "Software Engineering",
-            "Software Engineering and Cloud Computing",
-            "Advanced Software Engineering",
-            "Software Systems Engineering",
+    "Sports": {
+        "courses": [
+            "BSc Sports Science", "BSc Sports Coaching",
+            "MSc Sports Management", "BSc Physical Education",
+            "BSc Exercise and Health Science", "MSc Strength and Conditioning",
+            "BSc Sports Therapy", "BSc Sports Journalism",
+            "MSc Sport and Exercise Psychology", "BSc Sports Nutrition",
+            "BSc Sport Development", "MSc Sports Performance Analysis",
+            "BSc Sports Rehabilitation", "BSc Sport Business Management",
         ],
-        "focus_pool": ["Software Engineering", "Cloud Computing", "DevOps", "Systems Design", "Agile", "Distributed Systems"],
+        "focus_pool": [
+            "Sports Science", "Coaching", "Fitness", "Health", "Nutrition",
+            "Psychology", "Management", "Performance Analysis",
+        ],
     },
-    "Business Analytics": {
-        "variants": [
-            "Business Analytics",
-            "Business Analytics and Data Science",
-            "Management with Business Analytics",
-            "Business Analytics and Consulting",
+    "Literature": {
+        "courses": [
+            "BA English Literature", "BA Creative Writing",
+            "MA Comparative Literature", "BA English Language and Literature",
+            "MA Creative Writing", "BA Literature and Film",
+            "BA Children's Literature", "MA Victorian Literature",
+            "BA American Literature", "MA Modern Literature",
+            "BA Drama and Literature", "BA World Literature",
+            "BA Postcolonial Literature", "MA English Studies",
         ],
-        "focus_pool": ["Business", "Data Science", "Analytics", "Finance", "Strategy", "ML"],
+        "focus_pool": [
+            "Literature", "Creative Writing", "Critical Analysis", "Drama",
+            "Cultural Studies", "Research", "Linguistics",
+        ],
     },
-    "Finance": {
-        "variants": [
-            "Finance",
-            "Finance and Investment",
-            "Financial Technology (FinTech)",
-            "Mathematical Finance",
+    "Languages & Linguistics": {
+        "courses": [
+            "BA Modern Languages (French and Spanish)", "BA Linguistics",
+            "MA Translation Studies", "BA German Studies",
+            "BA Italian Studies", "BA Chinese Studies",
+            "MA Applied Linguistics", "BA Japanese Studies",
+            "BA Russian Studies", "BA Arabic Studies", "MA TESOL",
+            "BA French and Linguistics", "BA Hispanic Studies",
+            "MA Language and Communication",
         ],
-        "focus_pool": ["Finance", "Economics", "Risk Management", "Investment", "FinTech", "Data Science"],
+        "focus_pool": [
+            "Languages", "Linguistics", "Translation", "Communication",
+            "Culture", "TESOL", "Research",
+        ],
     },
-    "Biomedical Engineering": {
-        "variants": [
-            "Biomedical Engineering",
-            "Biomedical Engineering and Healthcare Technology",
-            "Medical Robotics and Image-Guided Intervention",
-            "Biomedical Data Science",
+    "Medicine & Health Sciences": {
+        "courses": [
+            "MBBS Medicine", "BSc Nursing", "MSc Public Health",
+            "BSc Pharmacy", "BSc Biomedical Science",
+            "MSc Healthcare Management", "BSc Physiotherapy",
+            "MSc Nutrition and Dietetics", "BSc Midwifery",
+            "MSc Epidemiology", "BSc Dentistry", "MSc Mental Health Nursing",
+            "BSc Paramedic Science", "MSc Clinical Research",
         ],
-        "focus_pool": ["Healthcare", "Engineering", "Biotech", "Medical Devices", "Research", "Data Science"],
+        "focus_pool": [
+            "Healthcare", "Medicine", "Clinical Practice", "Public Health",
+            "Nutrition", "Nursing", "Research",
+        ],
     },
-    "Computational Biology": {
-        "variants": [
-            "Computational Biology",
-            "Bioinformatics and Computational Biology",
-            "Computational Genomics",
-            "Health Data Science",
+    "Law": {
+        "courses": [
+            "LLB Law", "LLM International Law", "LLB Law with Criminology",
+            "LLM Human Rights Law", "LLB European Law",
+            "LLM Commercial Law", "LLB Law and Politics",
+            "LLM Intellectual Property Law", "LLB Business Law",
+            "LLM International Business Law", "LLB Law with French Law",
+            "LLM Environmental Law", "LLB Law with Spanish Law",
+            "LLM Maritime Law",
         ],
-        "focus_pool": ["Bioinformatics", "Data Science", "Healthcare", "ML", "Research", "Genomics"],
+        "focus_pool": [
+            "Law", "Human Rights", "Policy", "International Law",
+            "Commercial Law", "Criminology", "Research",
+        ],
     },
-    "Human-Computer Interaction": {
-        "variants": [
-            "Human-Computer Interaction",
-            "User Experience Design",
-            "Human-Centred Computer Systems",
-            "Interaction Design",
+    "Social Sciences": {
+        "courses": [
+            "BSc Psychology", "BA Sociology", "BA Politics",
+            "MA International Relations", "BA Social Policy",
+            "BSc Criminology", "BA Politics and Economics",
+            "MA Development Studies", "BSc Cognitive Science",
+            "BA Anthropology and Sociology", "MA Political Science",
+            "BSc Behavioural Science", "BA Social Work", "MA Global Studies",
         ],
-        "focus_pool": ["UX Design", "AI", "Cognitive Science", "Software Engineering", "Research", "Design"],
-    },
-    "Cloud Computing": {
-        "variants": [
-            "Cloud Computing",
-            "Cloud Computing and Networks",
-            "Cloud and Distributed Systems",
-            "Cloud Computing for Data Science",
+        "focus_pool": [
+            "Psychology", "Sociology", "Politics", "Policy",
+            "International Relations", "Social Work", "Research",
         ],
-        "focus_pool": ["Cloud Computing", "DevOps", "Networks", "Cybersecurity", "Systems Design", "Data Science"],
-    },
-    "Natural Language Processing": {
-        "variants": [
-            "Natural Language Processing",
-            "Speech and Language Processing",
-            "Computational Linguistics",
-            "Natural Language Processing and Machine Learning",
-        ],
-        "focus_pool": ["NLP", "AI", "ML", "Linguistics", "Research", "Deep Learning"],
-    },
-    "Computer Vision": {
-        "variants": [
-            "Computer Vision",
-            "Computer Vision and Machine Learning",
-            "Computer Vision and Robotics",
-            "Advanced Computer Vision",
-        ],
-        "focus_pool": ["Computer Vision", "AI", "ML", "Robotics", "Applied ML", "Deep Learning"],
-    },
-    "FinTech": {
-        "variants": [
-            "Financial Technology",
-            "FinTech and Data Science",
-            "FinTech with Artificial Intelligence",
-            "Banking and Digital Finance",
-        ],
-        "focus_pool": ["Finance", "AI", "Blockchain", "Data Science", "Software Engineering", "FinTech"],
-    },
-    "Renewable Energy Engineering": {
-        "variants": [
-            "Renewable Energy Engineering",
-            "Sustainable Energy Systems",
-            "Energy and Environmental Engineering",
-            "Clean Energy Technologies",
-        ],
-        "focus_pool": ["Sustainability", "Engineering", "Energy Systems", "Research", "Policy", "Climate"],
-    },
-    "Civil Engineering": {
-        "variants": [
-            "Civil Engineering",
-            "Structural Engineering",
-            "Civil Engineering with Sustainability",
-            "Infrastructure Engineering and Management",
-        ],
-        "focus_pool": ["Engineering", "Construction", "Sustainability", "Project Management", "Infrastructure"],
-    },
-    "Marketing Analytics": {
-        "variants": [
-            "Marketing Analytics",
-            "Digital Marketing and Analytics",
-            "Marketing with Data Analytics",
-            "Consumer Analytics",
-        ],
-        "focus_pool": ["Marketing", "Data Science", "Analytics", "Business", "Strategy", "Digital Media"],
-    },
-    "Public Health": {
-        "variants": [
-            "Public Health",
-            "Global Public Health",
-            "Public Health Data Science",
-            "Epidemiology and Public Health",
-        ],
-        "focus_pool": ["Healthcare", "Policy", "Epidemiology", "Data Science", "Research", "Global Health"],
-    },
-    "Quantum Computing": {
-        "variants": [
-            "Quantum Technology",
-            "Quantum Computing",
-            "Quantum Science and Technology",
-            "Quantum Engineering",
-        ],
-        "focus_pool": ["Quantum Computing", "Physics", "Research", "Cryptography", "Algorithms"],
     },
 }
 
-SUBJECT_NAMES = list(SUBJECTS.keys())
+# Minimum number of courses every university must offer per department.
+MIN_COURSES_PER_DEPARTMENT = 10
 
 
 # ---------------------------------------------------------------------------
-# Generation logic
+# CSV loading
 # ---------------------------------------------------------------------------
 
-def generate_record(rng: random.Random) -> dict:
-    """Generate a single synthetic course record."""
-    university = rng.choice(UNIVERSITIES)
-    subject_name = rng.choice(SUBJECT_NAMES)
-    subject = SUBJECTS[subject_name]
+def load_universities(csv_path):
+    universities = []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = (row.get("University_name") or "").strip()
+            if not name:
+                continue
+            region = (row.get("Region") or "").strip()
+            founded_raw = (row.get("Founded_year") or "").strip()
+            motto = (row.get("Motto") or "").strip()
+            rank_raw = (row.get("World_rank") or row.get("UK_rank") or "").strip()
 
-    degree = rng.choice(DEGREE_TYPES)
-    variant = rng.choice(subject["variants"])
-    course = f"{degree} {variant}"
+            founded_year = int(founded_raw) if founded_raw.isdigit() else None
+            uk_rank = int(rank_raw) if rank_raw.isdigit() else None
 
-    focus_pool = subject["focus_pool"]
-    # pick 2-4 focus tags, but never more than the pool size
-    k = rng.randint(2, min(4, len(focus_pool)))
-    focus = rng.sample(focus_pool, k)
+            universities.append({
+                "university": name,
+                "region": region,
+                "founded_year": founded_year,
+                "motto": motto if motto and motto.upper() != "NA" else None,
+                "uk_rank": uk_rank,
+            })
 
-    return {"university": university, "course": course, "focus": focus}
+    if not universities:
+        raise SystemExit(f"No universities found in '{csv_path}'.")
 
+    return universities
+
+
+# ---------------------------------------------------------------------------
+# Synthetic admissions statistics (derived from UK rank)
+# ---------------------------------------------------------------------------
+
+def admissions_stats(uk_rank, total_unis, rng: random.Random):
+    """Generate plausible acceptance-rate / competitiveness figures.
+
+    Lower UK rank (closer to 1) -> more selective -> lower acceptance
+    rates and "Very High" competitiveness. Higher-ranked-number
+    (less selective) universities tend to have higher acceptance rates
+    and are generally reported as more accessible / welcoming to
+    international (including Indian) applicants.
+    """
+    if uk_rank is None:
+        percentile = 0.5
+    else:
+        percentile = (uk_rank - 1) / max(total_unis - 1, 1)  # 0.0 .. 1.0
+
+    base_acceptance = 5 + percentile * 70  # ~5% .. ~75%
+    acceptance_rate = base_acceptance + rng.uniform(-5, 5)
+    acceptance_rate = max(2.0, min(85.0, acceptance_rate))
+
+    intl_delta = rng.uniform(-3, 8)
+    international_acceptance_rate = max(2.0, min(90.0, acceptance_rate + intl_delta))
+
+    if percentile < 0.10:
+        india_friendly_score = rng.randint(5, 7)
+        competitiveness = "Very High"
+    elif percentile < 0.30:
+        india_friendly_score = rng.randint(6, 8)
+        competitiveness = "High"
+    elif percentile < 0.60:
+        india_friendly_score = rng.randint(7, 9)
+        competitiveness = "Medium"
+    else:
+        india_friendly_score = rng.randint(8, 10)
+        competitiveness = "Low to Medium"
+
+    return {
+        "acceptance_rate_pct": round(acceptance_rate, 1),
+        "international_acceptance_rate_pct": round(international_acceptance_rate, 1),
+        "india_friendly_score": india_friendly_score,
+        "competitiveness": competitiveness,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Course generation
+# ---------------------------------------------------------------------------
+
+def generate_courses_for_university(rng: random.Random):
+    """Return a list of {course, department, focus} dicts covering every
+    department, with at least MIN_COURSES_PER_DEPARTMENT courses each."""
+    courses = []
+    for department, info in DEPARTMENTS.items():
+        pool = info["courses"]
+        focus_pool = info["focus_pool"]
+
+        # Pick MIN_COURSES_PER_DEPARTMENT..len(pool) courses (without
+        # replacement) so every university has at least the minimum,
+        # with some natural variation between universities.
+        k = rng.randint(MIN_COURSES_PER_DEPARTMENT, len(pool))
+        chosen = rng.sample(pool, k)
+
+        for course in chosen:
+            focus_k = rng.randint(2, min(4, len(focus_pool)))
+            focus = rng.sample(focus_pool, focus_k)
+            courses.append({"course": course, "department": department, "focus": focus})
+
+    return courses
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate synthetic UK course dataset")
-    parser.add_argument("--count", type=int, default=100_000, help="Number of records to generate")
+    parser = argparse.ArgumentParser(
+        description="Generate UK university + course dataset from a CSV of universities"
+    )
+    parser.add_argument("--csv", type=str, default="uk_universities.csv",
+                         help="Path to the input CSV of UK universities")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--out", type=str, default="courses_dataset", help="Output file base name (no extension)")
+    parser.add_argument("--out", type=str, default="courses_dataset",
+                         help="Output file base name for the flattened course dataset (no extension)")
+    parser.add_argument("--uni-out", type=str, default="universities_dataset.json",
+                         help="Output path for the nested per-university dataset")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
 
-    records = [generate_record(rng) for _ in range(args.count)]
+    universities = load_universities(args.csv)
+    total_unis = len(universities)
 
-    json_path = f"{args.out}.json"
+    uni_records = []
+    flat_records = []
+
+    for uni in universities:
+        stats = admissions_stats(uni["uk_rank"], total_unis, rng)
+        courses = generate_courses_for_university(rng)
+
+        record = {
+            "university": uni["university"],
+            "region": uni["region"],
+            "founded_year": uni["founded_year"],
+            "motto": uni["motto"],
+            "uk_rank": uni["uk_rank"],
+            **stats,
+            "courses": courses,
+        }
+        uni_records.append(record)
+
+        for c in courses:
+            flat_records.append({
+                "university": uni["university"],
+                "region": uni["region"],
+                "founded_year": uni["founded_year"],
+                "motto": uni["motto"],
+                "uk_rank": uni["uk_rank"],
+                **stats,
+                "course": c["course"],
+                "department": c["department"],
+                "focus": c["focus"],
+            })
+
+    # Nested per-university dataset
+    with open(args.uni_out, "w", encoding="utf-8") as f:
+        json.dump(uni_records, f, indent=2)
+
+    # Flattened per-course dataset (used for RAG / vector store ingestion)
     jsonl_path = f"{args.out}.jsonl"
-
-    # Single JSON array (matches the shape of the sample data given)
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2)
-
-    # JSON Lines (one record per line) - easier to stream for large datasets / RAG ingestion
     with open(jsonl_path, "w", encoding="utf-8") as f:
-        for rec in records:
+        for rec in flat_records:
             f.write(json.dumps(rec) + "\n")
 
-    print(f"Generated {len(records):,} records")
-    print(f"Wrote: {json_path}")
-    print(f"Wrote: {jsonl_path}")
+    # Also a single JSON array, for convenience / on-the-fly index builds
+    json_path = f"{args.out}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(flat_records, f, indent=2)
+
+    print(f"Loaded {total_unis:,} universities from '{args.csv}'.")
+    print(f"Wrote nested university dataset: {args.uni_out} ({len(uni_records):,} universities)")
+    print(f"Wrote flattened course dataset: {jsonl_path} ({len(flat_records):,} course records)")
+    print(f"Wrote flattened course dataset: {json_path} ({len(flat_records):,} course records)")
 
 
 if __name__ == "__main__":
