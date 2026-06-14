@@ -1,3 +1,69 @@
+"""
+generate_dataset.py
+
+Builds a synthetic-but-structured dataset of UK universities and the
+courses they offer, starting from a CSV of real UK universities
+(name, region, founded year, motto, UK rank).
+
+For every university in the CSV, this script:
+  - keeps the real-world fields (Region, Founded year, Motto, UK Rank)
+  - adds synthetic-but-plausible admissions statistics:
+        acceptance_rate_pct                (overall acceptance rate)
+        international_acceptance_rate_pct  (acceptance rate for
+                                             international applicants)
+        india_friendly_score (1-10)        (how accessible / welcoming
+                                             the university is reported
+                                             to be for Indian applicants,
+                                             considering things like
+                                             scholarships, dedicated
+                                             recruitment, visa & post
+                                             study work support, and the
+                                             size of the existing Indian
+                                             student community)
+        competitiveness                    (Very High / High / Medium /
+                                             Low to Medium - derived from
+                                             UK rank)
+  - generates a wide spread of courses across many departments
+    (Science, Technology & Engineering, Commerce & Business,
+    Arts & Humanities, Geography & Environment, Sports, Literature,
+    Languages & Linguistics, Medicine & Health Sciences, Law,
+    Social Sciences). Every university gets AT LEAST 10 courses from
+    EACH department.
+
+Two output files are written:
+
+  universities_dataset.json
+      One JSON object per university:
+        {
+          "university": "...",
+          "region": "...",
+          "founded_year": 1096,
+          "motto": "...",
+          "uk_rank": 1,
+          "acceptance_rate_pct": 7.2,
+          "international_acceptance_rate_pct": 9.8,
+          "india_friendly_score": 6,
+          "competitiveness": "Very High",
+          "courses": [
+              {"course": "BSc Physics", "department": "Science",
+               "focus": ["Physics", "Research"]},
+              ...
+          ]
+        }
+
+  courses_dataset.jsonl
+      A flattened, one-line-per-course view of the same data (one
+      record per (university, course) pair, with the university-level
+      fields repeated on every line). This is the file consumed by
+      build_vectorstore.py / app.py for retrieval, since RAG retrieval
+      operates at the course level.
+
+Usage:
+    python generate_dataset.py
+    python generate_dataset.py --csv uk_universities.csv --seed 42 \
+        --out courses_dataset --uni-out universities_dataset.json
+"""
+
 import argparse
 import csv
 import json

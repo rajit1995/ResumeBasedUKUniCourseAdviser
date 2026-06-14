@@ -1,3 +1,42 @@
+"""
+app.py
+
+A Gradio web app that:
+  1. Takes a resume (PDF / TXT upload).
+  2. On request, asks a local Ollama LLM to read the resume and write an
+     "Analysis Report" (education status, skills, experience, interests)
+     into an editable textbox - the candidate/advisor can review or edit
+     it before requesting recommendations.
+  3. Uses the (possibly-edited) analysis report to determine whether the
+     candidate has completed a Bachelor's degree, then uses a FAISS
+     vector store (built from courses_dataset.jsonl via
+     build_vectorstore.py) to retrieve the most relevant UK university
+     courses at the appropriate level (Bachelor's vs Master's-and-above)
+     (Retrieval-Augmented Generation). Each retrieved course carries its
+     university's UK rank, acceptance rate and competitiveness.
+  4. Asks the LLM to act as an admissions-aware advisor: it weighs how
+     well each course matches the candidate's background AND how
+     realistic admission is (given the university's ranking,
+     competitiveness, and acceptance rates), then returns a
+     list of 10 courses/universities the candidate is realistically
+     eligible for.
+
+Prerequisites
+-------------
+1. Install Ollama: https://ollama.com
+2. Pull the models used here (you can change the names below):
+       ollama pull nomic-embed-text
+       ollama pull llama3
+3. Generate the dataset and build the index (one-time setup):
+       python generate_dataset.py
+       python build_vectorstore.py
+
+Run
+---
+    python app.py
+
+Then open the printed local URL in your browser.
+"""
 
 import os
 import json
@@ -133,29 +172,36 @@ RECOMMENDATION_PROMPT = ChatPromptTemplate.from_messages(
         (
             "system",
             "You are an admissions-aware career and education advisor specialising "
-            "in UK university courses, with particular experience advising Indian "
-            "and other international applicants.\n\n"
+            "in UK university courses, with particular experience advising "
+            "international applicants.\n\n"
             "You will be given a candidate's resume text and a list of candidate "
             "UK university courses retrieved from a course database. Each candidate "
             "course includes:\n"
             "  - the course name and department\n"
             "  - the university name, region and UK rank\n"
             "  - the university's overall acceptance rate\n"
-            "  - the university's acceptance rate for international applicants\n"
-            "  - an India-friendliness score (1-10), reflecting how accessible / "
-            "welcoming the university is reported to be for Indian applicants "
-            "(scholarships, dedicated recruitment, visa and post-study work support, "
-            "size of existing Indian student community)\n"
             "  - a competitiveness rating (Very High / High / Medium / Low to Medium)\n\n"
             "IMPORTANT — Study level: {level_instruction}\n\n"
+            "IMPORTANT — Weighting: when selecting and ranking courses, weight "
+            "QUALIFICATION FIT (how well the candidate's academic background, "
+            "field of study, grades, skills, projects and experience match the "
+            "subject matter and entry expectations of the course) as roughly "
+            "95% of your decision. All other factors combined - UK rank, "
+            "competitiveness, and acceptance rate - should together account for "
+            "at most about 5%, and should only be used as a tie-breaker between "
+            "courses that are already a strong qualification match. Be strict: "
+            "do NOT recommend a course primarily because the university is "
+            "prestigious, has a high acceptance rate, or is a 'safe' choice if "
+            "the subject area does not genuinely align with the candidate's "
+            "qualifications and background. A course that is a poor "
+            "subject-matter fit should not be recommended even if admission "
+            "would be easy.\n\n"
             "Your job is to select and rank the top {top_n} courses from the provided "
             "list that the candidate is REALISTICALLY ELIGIBLE FOR — i.e. courses "
             "that both (a) genuinely match the candidate's qualifications, skills, "
             "academic background and interests, AND (b) have an admission "
-            "likelihood that is reasonable given the candidate's profile, the "
-            "university's UK rank/competitiveness, its acceptance rates, and (where "
-            "relevant) its India-friendliness score and openness to international "
-            "applicants.\n\n"
+            "likelihood that is reasonable given the candidate's profile and the "
+            "university's UK rank/competitiveness and acceptance rate.\n\n"
             "Rules:\n"
             "- Only recommend courses that appear in the 'Candidate courses' list "
             "below. Do not invent universities, departments or courses.\n"
@@ -163,18 +209,21 @@ RECOMMENDATION_PROMPT = ChatPromptTemplate.from_messages(
             "Postgraduate). Only recommend courses whose Level matches the study "
             "level specified above — do not recommend courses from the other "
             "level under any circumstances.\n"
-            "- Favour a realistic, achievable mix: don't recommend only the most "
-            "prestigious / Very High competitiveness universities unless the "
-            "candidate's profile is exceptionally strong. Where appropriate, "
-            "include a healthy spread across competitiveness levels (e.g. some "
-            "ambitious 'reach' options alongside solid 'match' and safer 'likely' "
-            "options) so the candidate has realistic choices.\n"
+            "- Favour a realistic, achievable mix WHERE POSSIBLE WITHOUT "
+            "SACRIFICING QUALIFICATION FIT: among courses that are strong "
+            "subject-matter matches, prefer a spread across competitiveness "
+            "levels (e.g. some ambitious 'reach' options alongside solid "
+            "'match' and safer 'likely' options) rather than only the most "
+            "prestigious / Very High competitiveness universities, unless the "
+            "candidate's profile is exceptionally strong. However, never "
+            "include a course with poor qualification fit merely to fill out "
+            "this spread.\n"
             "- Rank from most relevant/realistic (1) to least (({top_n})).\n"
             "- For each recommendation, give a short (2-3 sentence) reason that "
             "covers: (i) why the course fits the candidate's background, skills or "
             "interests, and (ii) why admission is realistic for this candidate, "
-            "referencing the university's ranking/competitiveness, acceptance rate, "
-            "and India-friendliness/international acceptance where relevant.\n"
+            "referencing the university's ranking/competitiveness and acceptance "
+            "rates where relevant.\n"
             "- Respond in clean Markdown using a numbered list, with the format:\n"
             "  **N. Course Name — University Name (UK Rank #X, Competitiveness: Y)**\n"
             "  Reason: ...\n",
@@ -299,12 +348,31 @@ RESUME_ANALYSIS_PROMPT = ChatPromptTemplate.from_messages(
             "mentioned preference for studying abroad, the UK specifically, or "
             "particular countries.\n\n"
             "## 9. Overall Assessment\n"
-            "A substantive paragraph (4-6 sentences) summarising the candidate's "
-            "academic strengths, technical depth, breadth vs. specialisation, "
-            "standout achievements, any gaps or areas that may need "
-            "strengthening, and an overall view of their readiness and "
-            "suitability for further study (Bachelor's or Master's level, as "
-            "appropriate to their current stage).\n\n"
+            "Write a detailed, multi-paragraph assessment (at least 4 "
+            "paragraphs, analytical in tone - this should be your own analysis "
+            "and evaluation, NOT a restatement or summary of the resume's "
+            "contents, which are already covered in sections 1-8). Cover:\n"
+            "  - Academic strengths and intellectual profile: depth vs. breadth "
+            "across the candidate's qualifications and coursework, and what "
+            "their academic trajectory suggests about their abilities and "
+            "trajectory.\n"
+            "  - Technical/professional profile: how the candidate's skills, "
+            "experience, and projects fit together, what specialisations or "
+            "domains they are best positioned for, and how competitive their "
+            "profile is relative to typical applicants at their stage.\n"
+            "  - Standout strengths and differentiators: what makes this "
+            "candidate notable, and any gaps, inconsistencies, or areas that "
+            "could be strengthened (e.g. limited research experience, narrow "
+            "technical breadth, no leadership exposure).\n"
+            "  - Overall readiness and suitability for further study at the "
+            "appropriate level (Bachelor's or Master's, per their current "
+            "stage), including the types of courses, departments or "
+            "specialisations they appear best suited to, and any considerations "
+            "relevant to applying to competitive UK universities.\n\n"
+            "Do not repeat large verbatim chunks of the resume text or restate "
+            "the bullet points from earlier sections - this section should read "
+            "as an evaluator's analysis built on top of those facts, not a "
+            "second copy of them.\n\n"
             "Base everything strictly on the resume text provided - do not "
             "invent details. If a section genuinely has no information, write "
             "'Not specified' for that section rather than omitting it.",
@@ -396,8 +464,6 @@ def build_candidates_text(docs) -> str:
         rank_str = f"#{rank}" if rank is not None else "Unranked"
 
         acceptance = meta.get("acceptance_rate_pct")
-        intl_acceptance = meta.get("international_acceptance_rate_pct")
-        india_score = meta.get("india_friendly_score")
         competitiveness = meta.get("competitiveness", "Unknown")
         region = meta.get("region", "")
 
@@ -407,8 +473,6 @@ def build_candidates_text(docs) -> str:
             f"Level: {course_level(meta['course']).capitalize()} | "
             f"Competitiveness: {competitiveness} | "
             f"Acceptance rate: {acceptance}% | "
-            f"International acceptance rate: {intl_acceptance}% | "
-            f"India-friendliness (1-10): {india_score} | "
             f"Focus: {focus}"
         )
     return "\n".join(lines)
@@ -486,27 +550,6 @@ def recommend_courses(analysis_report_input):
 with gr.Blocks(title="UK Course Recommender (RAG + Ollama)") as demo:
     gr.Markdown(
         "# 🎓 UK Course Recommender\n"
-        "Upload a resume (PDF or TXT) and click **Analyze Resume** - a local "
-        "LLM (via Ollama) will read it and write an **Analysis Report** "
-        "(education, skills, experience, interests). Review/edit the report if "
-        "needed, then click **Get Course Recommendations**.\n\n"
-        "The app retrieves the most relevant UK university courses from a "
-        "course database using embeddings, then asks the LLM to suggest the "
-        f"top {TOP_N_RECOMMEND} courses/universities you're realistically "
-        "eligible for - based on your qualifications and interests, "
-        "course/university ranking, competitiveness, acceptance rates, and how "
-        "welcoming each university is towards international (including Indian) "
-        "applicants.\n\n"
-        "**Study level is detected automatically from the analysis report:** if "
-        "it shows the candidate has already completed a Bachelor's degree, only "
-        "Master's-and-above courses are recommended; if the candidate hasn't "
-        "completed a Bachelor's degree yet (including currently studying for "
-        "one), only Bachelor's-level courses are recommended."
-    )
-
-with gr.Blocks(title="UK Course Recommender (RAG + Ollama)") as demo:
-    gr.Markdown(
-        "# 🎓 UK Course Recommender\n"
         "Upload a resume (PDF or TXT) and click **Analyze & Recommend**. A "
         "local LLM (via Ollama) will:\n"
         "1. Read the resume and write a detailed **Analysis Report** "
@@ -517,9 +560,12 @@ with gr.Blocks(title="UK Course Recommender (RAG + Ollama)") as demo:
         f"3. Recommend the top {TOP_N_RECOMMEND} courses/universities the "
         "candidate is realistically eligible for - based on their "
         "qualifications and interests, course/university ranking, "
-        "competitiveness, acceptance rates, and how welcoming each university "
-        "is towards international (including Indian) applicants.\n\n"
-
+        "competitiveness, and acceptance rates.\n\n"
+        "**Study level is detected automatically from the analysis report:** if "
+        "it shows the candidate has already completed a Bachelor's degree, only "
+        "Master's-and-above courses are recommended; if the candidate hasn't "
+        "completed a Bachelor's degree yet (including currently studying for "
+        "one), only Bachelor's-level courses are recommended."
     )
 
     with gr.Row():
